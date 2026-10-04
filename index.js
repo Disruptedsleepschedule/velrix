@@ -52,7 +52,61 @@ app.post("/chat", async (req, res) => {
     });
   }
 });
+    app.post("/verify", async (req, res) => {
+  try {
+    const { network, agentId } = req.body;
 
+    if (!network || !agentId) {
+      return res.status(400).json({
+        error: "network and agentId are required"
+      });
+    }
+
+    // Şimdilik Velrix Verify v0.1 sadece Base'i destekliyor.
+    if (network.toLowerCase() !== "base") {
+      return res.status(400).json({
+        error: "Velrix Verify currently supports Base only"
+      });
+    }
+
+    const chainId = 8453;
+
+    const apiResponse = await fetch(
+      `https://api.8004scan.io/api/v1/agents/${chainId}/${agentId}`
+    );
+
+    if (!apiResponse.ok) {
+      return res.status(apiResponse.status).json({
+        error: "Agent could not be found",
+        chainId,
+        agentId
+      });
+    }
+
+    const agentData = await apiResponse.json();
+
+    res.json({
+      verifier: "Velrix",
+      version: "0.1",
+      target: {
+        network: "Base",
+        chainId,
+        agentId
+      },
+      verification: {
+        identityFound: true
+      },
+      evidence: agentData
+    });
+
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      error: "Velrix Verify failed"
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(`Velrix is running at http://localhost:${PORT}`);
 });
