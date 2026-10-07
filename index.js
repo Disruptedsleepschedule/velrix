@@ -173,6 +173,78 @@ async function checkEndpointHealth(endpoint) {
     clearTimeout(timeout);
   }
 }
+async function testChatCapability(endpoint) {
+  const safety = await resolveSafeEndpoint(endpoint);
+
+  if (!safety.safe) {
+    return {
+      endpoint,
+      tested: false,
+      passed: false,
+      reason: safety.reason
+    };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
+  const startedAt = Date.now();
+
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      redirect: "manual",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        message: "Reply with exactly: VELRIX_CAPABILITY_OK"
+      }),
+      signal: controller.signal
+    });
+
+    const responseTimeMs = Date.now() - startedAt;
+
+    let data = null;
+
+    try {
+      data = await response.json();
+    } catch {
+      // Response was not JSON.
+    }
+
+    const responseText =
+      typeof data?.response === "string"
+        ? data.response.trim()
+        : "";
+
+    const passed =
+      response.ok &&
+      responseText === "VELRIX_CAPABILITY_OK";
+
+    return {
+      endpoint,
+      tested: true,
+      passed,
+      httpStatus: response.status,
+      responseTimeMs,
+      expected: "VELRIX_CAPABILITY_OK",
+      received: responseText || null
+    };
+  } catch (error) {
+    return {
+      endpoint,
+      tested: true,
+      passed: false,
+      reason:
+        error.name === "AbortError"
+          ? "Capability test timed out"
+          : "Capability test failed"
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 app.get("/", (req, res) => {
   res.json({
     agent: "Velrix",
@@ -268,6 +340,12 @@ for (const endpoint of declaredEndpoints) {
   const health = await checkEndpointHealth(endpoint);
   endpointHealth.push(health);
 }
+const capabilityTests = [];
+
+for (const endpoint of declaredEndpoints) {
+  const capability = await testChatCapability(endpoint);
+  capabilityTests.push(capability);
+}
     res.json({
       verifier: "Velrix",
       version: "0.1",
@@ -280,7 +358,8 @@ for (const endpoint of declaredEndpoints) {
         identityFound: true,
         declaredEndpoints,
         endpointSafety,
-        endpointHealth
+        endpointHealth,
+        capabilityTests
       },
       evidence: agentData
     });
