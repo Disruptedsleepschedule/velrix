@@ -245,6 +245,64 @@ async function testChatCapability(endpoint) {
     clearTimeout(timeout);
   }
 }
+function buildVerifyReport(agentData, endpointHealth, capabilityTests) {
+  const identityVerified = Boolean(agentData);
+
+  const reachableEndpoints = endpointHealth.filter(
+    item => item.reachable === true
+  );
+
+  const passedCapabilities = capabilityTests.filter(
+    item => item.passed === true
+  );
+
+  const warnings = [];
+
+  if (reachableEndpoints.length === 0) {
+    warnings.push("No reachable endpoint was confirmed.");
+  }
+
+  if (passedCapabilities.length === 0) {
+    warnings.push("No capability test was successfully verified.");
+  }
+
+  if ((agentData?.total_feedbacks || 0) === 0) {
+    warnings.push("No feedback history was found.");
+  }
+
+  if ((agentData?.total_validations || 0) === 0) {
+    warnings.push("No validation history was found.");
+  }
+
+  return {
+    identity: {
+      status: identityVerified ? "FOUND" : "NOT_FOUND",
+      agentId: agentData?.token_id || null,
+      name: agentData?.name || null,
+      owner: agentData?.owner_address || null
+    },
+
+    endpoint: {
+      status:
+        reachableEndpoints.length > 0
+          ? "REACHABLE"
+          : "NOT_CONFIRMED",
+      reachableCount: reachableEndpoints.length,
+      testedCount: endpointHealth.length
+    },
+
+    capability: {
+      status:
+        passedCapabilities.length > 0
+          ? "VERIFIED"
+          : "NOT_VERIFIED",
+      passedCount: passedCapabilities.length,
+      testedCount: capabilityTests.length
+    },
+
+    warnings
+  };
+}
 app.get("/", (req, res) => {
   res.json({
     agent: "Velrix",
@@ -341,6 +399,15 @@ for (const endpoint of declaredEndpoints) {
   endpointHealth.push(health);
 }
 const capabilityTests = [];
+for (const endpoint of declaredEndpoints) {
+  const capability = await testChatCapability(endpoint);
+  capabilityTests.push(capability);
+}
+const report = buildVerifyReport(
+  agentData,
+  endpointHealth,
+  capabilityTests
+);
 
 for (const endpoint of declaredEndpoints) {
   const capability = await testChatCapability(endpoint);
@@ -361,6 +428,7 @@ for (const endpoint of declaredEndpoints) {
         endpointHealth,
         capabilityTests
       },
+      report,
       evidence: agentData
     });
   } catch (error) {
