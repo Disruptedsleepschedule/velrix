@@ -186,7 +186,7 @@ async function testChatCapability(endpoint) {
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
+  const timeout = setTimeout(() => controller.abort(), 30000);
 
   const startedAt = Date.now();
 
@@ -303,6 +303,46 @@ function buildVerifyReport(agentData, endpointHealth, capabilityTests) {
     warnings
   };
 }
+async function testChatCapabilityWithRetry(endpoint) {
+  const firstAttempt = await testChatCapability(endpoint);
+
+  if (firstAttempt.passed || !firstAttempt.tested) {
+    return {
+      ...firstAttempt,
+      attempts: 1,
+      retried: false
+    };
+  }
+
+  // Only retry temporary failures, not normal test failures.
+  const temporaryFailure =
+    firstAttempt.reason === "Capability test timed out" ||
+    firstAttempt.reason === "Capability test failed" ||
+    firstAttempt.httpStatus === 429 ||
+    firstAttempt.httpStatus >= 500;
+
+  if (!temporaryFailure) {
+    return {
+      ...firstAttempt,
+      attempts: 1,
+      retried: false
+    };
+  }
+
+  await new Promise(resolve => setTimeout(resolve, 2000));
+
+  const secondAttempt = await testChatCapability(endpoint);
+
+  return {
+    ...secondAttempt,
+    attempts: 2,
+    retried: true,
+    firstAttempt,
+    coldStartSuspected:
+      firstAttempt.reason === "Capability test timed out" &&
+      secondAttempt.passed === true
+  };
+}
 app.get("/", (req, res) => {
   res.json({
     agent: "Velrix",
@@ -400,7 +440,7 @@ for (const endpoint of declaredEndpoints) {
 }
 const capabilityTests = [];
 for (const endpoint of declaredEndpoints) {
-  const capability = await testChatCapability(endpoint);
+  const capability = await testChatCapabilityWithRetry(endpoint);
   capabilityTests.push(capability);
 }
 const report = buildVerifyReport(
@@ -409,10 +449,6 @@ const report = buildVerifyReport(
   capabilityTests
 );
 
-for (const endpoint of declaredEndpoints) {
-  const capability = await testChatCapability(endpoint);
-  capabilityTests.push(capability);
-}
     res.json({
       verifier: "Velrix",
       version: "0.1",
