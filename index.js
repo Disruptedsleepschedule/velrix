@@ -4,7 +4,8 @@ const express = require("express");
 const OpenAI = require("openai");
 const net = require("net");
 const dns = require("dns").promises;
-
+const { Agent } = require("undici");
+const ipaddr = require("ipaddr.js");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -53,36 +54,18 @@ function isSafeEndpoint(endpoint) {
 }
 
 function isPrivateIP(ip) {
-  if (!net.isIP(ip)) {
+  try {
+    const address = ipaddr.process(ip);
+
+    // Yalnızca genel internette yönlendirilebilir
+    // adreslere izin ver.
+    return address.range() !== "unicast";
+  } catch {
+    // Geçersiz veya tanınmayan IP adreslerini engelle.
     return true;
   }
-
-  if (ip === "::1" || ip === "0.0.0.0") {
-    return true;
-  }
-
-  if (
-    ip.startsWith("127.") ||
-    ip.startsWith("10.") ||
-    ip.startsWith("192.168.")
-  ) {
-    return true;
-  }
-
-  const parts = ip.split(".").map(Number);
-
-  if (
-    parts.length === 4 &&
-    parts[0] === 172 &&
-    parts[1] >= 16 &&
-    parts[1] <= 31
-  ) {
-    return true;
-  }
-
-  return false;
 }
-
+  
 async function resolveSafeEndpoint(endpoint) {
   try {
     if (!isSafeEndpoint(endpoint)) {

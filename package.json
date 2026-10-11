@@ -13,6 +13,8 @@
   "dependencies": {
     "dotenv": "^18.0.4",
     "express": "^5.2.1",
-    "openai": "^7.25.0"
+    "ipaddr.js": "^2.5.0",
+    "openai": "^7.25.0",
+    "undici": "^8.11.2"
   }
 }
