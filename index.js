@@ -405,11 +405,15 @@ app.post("/verify", async (req, res) => {
   try {
     const { network, agentId } = req.body;
 
-    if (!network || !agentId) {
-      return res.status(400).json({
-        error: "network and agentId are required"
-      });
-    }
+    if (
+  typeof network !== "string" ||
+  !["string", "number"].includes(typeof agentId) ||
+  !/^[0-9]{1,20}$/.test(String(agentId))
+) {
+  return res.status(400).json({
+    error: "Valid network and numeric agentId are required"
+  });
+}
 
     if (network.toLowerCase() !== "base") {
       return res.status(400).json({
@@ -420,8 +424,12 @@ app.post("/verify", async (req, res) => {
     const chainId = 8453;
 
     const apiResponse = await fetch(
-      `https://api.8004scan.io/api/v1/agents/${chainId}/${agentId}`
-    );
+  `https://api.8004scan.io/api/v1/agents/${chainId}/${agentId}`,
+  {
+    redirect: "manual",
+    signal: AbortSignal.timeout(10000)
+  }
+);
 
     if (!apiResponse.ok) {
       return res.status(apiResponse.status).json({
