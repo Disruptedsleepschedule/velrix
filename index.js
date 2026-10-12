@@ -24,7 +24,15 @@ function isSafeEndpoint(endpoint) {
     }
 
     const hostname = url.hostname.toLowerCase();
+    // Reject direct IP addresses, including IPv6 literals.
+const normalizedHostname =
+  hostname.startsWith("[") && hostname.endsWith("]")
+    ? hostname.slice(1, -1)
+    : hostname;
 
+if (net.isIP(normalizedHostname)) {
+  return false;
+}
     if (
       hostname === "localhost" ||
       hostname === "0.0.0.0" ||
@@ -52,7 +60,32 @@ function isSafeEndpoint(endpoint) {
     return false;
   }
 }
+function createSafeDispatcher() {
+  return new Agent({
+    connect: {
+      lookup: (hostname, options, callback) => {
+        dns.lookup(hostname, { ...options, all: true })
+          .then((addresses) => {
+            if (
+              addresses.length === 0 ||
+              addresses.some(item => isPrivateIP(item.address))
+            ) {
+              return callback(new Error("Unsafe IP address"));
+            }
 
+            if (options.all) {
+              return callback(null, addresses);
+            }
+
+            const selected = addresses[0];
+            callback(null, selected.address, selected.family);
+          })
+          .catch(callback);
+      }
+    }
+  });
+}
+const safeDispatcher = createSafeDispatcher();
 function isPrivateIP(ip) {
   try {
     const address = ipaddr.process(ip);
@@ -130,6 +163,7 @@ async function checkEndpointHealth(endpoint) {
     const response = await fetch(endpoint, {
       method: "GET",
       redirect: "manual",
+      dispatcher: safeDispatcher,
       signal: controller.signal
     });
 
@@ -177,6 +211,7 @@ async function testChatCapability(endpoint) {
     const response = await fetch(endpoint, {
       method: "POST",
       redirect: "manual",
+      dispatcher: safeDispatcher,
       headers: {
         "Content-Type": "application/json"
       },
