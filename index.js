@@ -6,11 +6,14 @@ const net = require("net");
 const dns = require("dns").promises;
 const { Agent } = require("undici");
 const ipaddr = require("ipaddr.js");
+const { LIMITS, createChatGuard, createVerifyGuard, limitConcurrency,
+  withinDeadline, readLimitedJson, discardBody, boundedModelFetch } = require("./security");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
+  apiKey: process.env.OPENAI_API_KEY,
+  fetch: boundedModelFetch
 });
 
 app.use(express.json());
@@ -99,7 +102,7 @@ function isPrivateIP(ip) {
   }
 }
   
-async function resolveSafeEndpoint(endpoint) {
+async function resolveSafeEndpoint(endpoint, signal) {
   try {
     if (!isSafeEndpoint(endpoint)) {
       return {
@@ -110,9 +113,9 @@ async function resolveSafeEndpoint(endpoint) {
 
     const url = new URL(endpoint);
 
-    const addresses = await dns.lookup(url.hostname, {
+    const addresses = await withinDeadline(signal, () => dns.lookup(url.hostname, {
       all: true
-    });
+    }));
 
     if (addresses.length === 0) {
       return {
@@ -136,14 +139,15 @@ async function resolveSafeEndpoint(endpoint) {
       addresses: addresses.map(item => item.address)
     };
   } catch (error) {
+    signal.throwIfAborted();
     return {
       safe: false,
       reason: "DNS lookup failed"
     };
   }
 }
-async function checkEndpointHealth(endpoint) {
-  const safety = await resolveSafeEndpoint(endpoint);
+async function checkEndpointHealth(endpoint, signal) {
+  const safety = await resolveSafeEndpoint(endpoint, signal);
 
   if (!safety.safe) {
     return {
@@ -160,14 +164,16 @@ async function checkEndpointHealth(endpoint) {
   const startedAt = Date.now();
 
   try {
-    const response = await fetch(endpoint, {
+    const response = await withinDeadline(signal, () => fetch(endpoint, {
       method: "GET",
       redirect: "manual",
       dispatcher: safeDispatcher,
-      signal: controller.signal
-    });
+      signal: AbortSignal.any([controller.signal, signal])
+    }));
 
     const responseTimeMs = Date.now() - startedAt;
+
+    discardBody(response);
 
     return {
       endpoint,
@@ -177,6 +183,7 @@ async function checkEndpointHealth(endpoint) {
       responseTimeMs
     };
   } catch (error) {
+    signal.throwIfAborted();
     return {
       endpoint,
       reachable: false,
@@ -190,8 +197,8 @@ async function checkEndpointHealth(endpoint) {
     clearTimeout(timeout);
   }
 }
-async function testChatCapability(endpoint) {
-  const safety = await resolveSafeEndpoint(endpoint);
+async function testChatCapability(endpoint, signal) {
+  const safety = await resolveSafeEndpoint(endpoint, signal);
 
   if (!safety.safe) {
     return {
@@ -208,7 +215,7 @@ async function testChatCapability(endpoint) {
   const startedAt = Date.now();
 
   try {
-    const response = await fetch(endpoint, {
+    const response = await withinDeadline(signal, () => fetch(endpoint, {
       method: "POST",
       redirect: "manual",
       dispatcher: safeDispatcher,
@@ -218,16 +225,28 @@ async function testChatCapability(endpoint) {
       body: JSON.stringify({
         message: "Reply with exactly: VELRIX_CAPABILITY_OK"
       }),
-      signal: controller.signal
-    });
+      signal: AbortSignal.any([controller.signal, signal])
+    }));
 
     const responseTimeMs = Date.now() - startedAt;
+
+    if (response.status === 401) {
+      discardBody(response);
+      return {
+        endpoint, tested: true, passed: false,
+        authenticationRequired: true, httpStatus: 401, responseTimeMs,
+        reason: "Authentication required"
+      };
+    }
 
     let data = null;
 
     try {
-      data = await response.json();
-    } catch {
+      data = await readLimitedJson(response, LIMITS.capabilityResponseBytes,
+        AbortSignal.any([controller.signal, signal]));
+    } catch (error) {
+      signal.throwIfAborted();
+      if (error.code === "RESPONSE_TOO_LARGE") throw error;
       // Response was not JSON.
     }
 
@@ -250,12 +269,15 @@ async function testChatCapability(endpoint) {
       received: responseText || null
     };
   } catch (error) {
+    signal.throwIfAborted();
     return {
       endpoint,
       tested: true,
       passed: false,
       reason:
-        error.name === "AbortError"
+        error.code === "RESPONSE_TOO_LARGE"
+          ? "Capability response exceeds size limit"
+          : error.name === "AbortError"
           ? "Capability test timed out"
           : "Capability test failed"
     };
@@ -273,6 +295,9 @@ function buildVerifyReport(agentData, endpointHealth, capabilityTests) {
   const passedCapabilities = capabilityTests.filter(
     item => item.passed === true
   );
+  const authenticationRequiredCount = capabilityTests.filter(
+    item => item.authenticationRequired === true
+  ).length;
 
   const warnings = [];
 
@@ -282,6 +307,9 @@ function buildVerifyReport(agentData, endpointHealth, capabilityTests) {
 
   if (passedCapabilities.length === 0) {
     warnings.push("No capability test was successfully verified.");
+  }
+  if (authenticationRequiredCount > 0) {
+    warnings.push("Some capability endpoints require authentication; no credentials were sent.");
   }
 
   if ((agentData?.total_feedbacks || 0) === 0) {
@@ -313,16 +341,17 @@ function buildVerifyReport(agentData, endpointHealth, capabilityTests) {
       status:
         passedCapabilities.length > 0
           ? "VERIFIED"
-          : "NOT_VERIFIED",
+          : authenticationRequiredCount > 0 ? "AUTHENTICATION_REQUIRED" : "NOT_VERIFIED",
       passedCount: passedCapabilities.length,
+      authenticationRequiredCount,
       testedCount: capabilityTests.length
     },
 
     warnings
   };
 }
-async function testChatCapabilityWithRetry(endpoint) {
-  const firstAttempt = await testChatCapability(endpoint);
+async function testChatCapabilityWithRetry(endpoint, signal) {
+  const firstAttempt = await testChatCapability(endpoint, signal);
 
   if (firstAttempt.passed || !firstAttempt.tested) {
     return {
@@ -347,9 +376,9 @@ async function testChatCapabilityWithRetry(endpoint) {
     };
   }
 
-  await new Promise(resolve => setTimeout(resolve, 2000));
+  await withinDeadline(signal, () => require("node:timers/promises").setTimeout(2000, undefined, { signal }));
 
-  const secondAttempt = await testChatCapability(endpoint);
+  const secondAttempt = await testChatCapability(endpoint, signal);
 
   return {
     ...secondAttempt,
@@ -371,13 +400,20 @@ app.get("/", (req, res) => {
   });
 });
 
-app.post("/chat", async (req, res) => {
+app.post("/chat", createChatGuard(), limitConcurrency(LIMITS.chatConcurrent, async (req, res) => {
   try {
-    const message = req.body.message;
+    const message = req.body?.message;
 
-    if (!message) {
+    if (typeof message !== "string" || !message.trim()) {
       return res.status(400).json({
-        error: "message is required"
+        error: "A non-empty string message is required"
+      });
+    }
+
+    if (message.length > LIMITS.chatMessageLength) {
+      return res.status(413).json({
+        error: "Message exceeds maximum length",
+        maxLength: LIMITS.chatMessageLength
       });
     }
 
@@ -399,11 +435,14 @@ app.post("/chat", async (req, res) => {
       error: "Velrix AI request failed"
     });
   }
-});
+}));
 
-app.post("/verify", async (req, res) => {
+app.post("/verify", createVerifyGuard(), limitConcurrency(LIMITS.verifyConcurrent, async (req, res) => {
+  const controller = new AbortController();
+  const signal = controller.signal;
+  const timeout = setTimeout(() => controller.abort(new Error("Verify deadline exceeded")), LIMITS.verifyTimeoutMs);
   try {
-    const { network, agentId } = req.body;
+    const { network, agentId } = req.body || {};
 
     if (
   typeof network !== "string" ||
@@ -423,15 +462,16 @@ app.post("/verify", async (req, res) => {
 
     const chainId = 8453;
 
-    const apiResponse = await fetch(
+    const apiResponse = await withinDeadline(signal, () => fetch(
   `https://api.8004scan.io/api/v1/agents/${chainId}/${agentId}`,
   {
     redirect: "manual",
-    signal: AbortSignal.timeout(10000)
+    signal: AbortSignal.any([AbortSignal.timeout(10000), signal])
   }
-);
+));
 
     if (!apiResponse.ok) {
+      discardBody(apiResponse);
       return res.status(apiResponse.status).json({
         error: "Agent could not be found",
         chainId,
@@ -439,19 +479,30 @@ app.post("/verify", async (req, res) => {
       });
     }
 
-    const agentData = await apiResponse.json();
+    const agentData = await readLimitedJson(apiResponse, LIMITS.registryResponseBytes, signal);
 
     const services =
       agentData?.raw_metadata?.offchain_content?.services || [];
 
+    if (!Array.isArray(services)) {
+      return res.status(502).json({ error: "Invalid agent services metadata" });
+    }
+
     const declaredEndpoints = services
-      .map(service => service.endpoint)
+      .map(service => service?.endpoint)
       .filter(endpoint => typeof endpoint === "string");
+
+    if (declaredEndpoints.length > LIMITS.verifyEndpoints) {
+      return res.status(422).json({
+        error: "Agent exceeds maximum endpoint count",
+        maxEndpoints: LIMITS.verifyEndpoints
+      });
+    }
 
     const endpointSafety = [];
 
     for (const endpoint of declaredEndpoints) {
-      const safety = await resolveSafeEndpoint(endpoint);
+      const safety = await resolveSafeEndpoint(endpoint, signal);
 
       endpointSafety.push({
         endpoint,
@@ -461,12 +512,12 @@ app.post("/verify", async (req, res) => {
 const endpointHealth = [];
 
 for (const endpoint of declaredEndpoints) {
-  const health = await checkEndpointHealth(endpoint);
+  const health = await checkEndpointHealth(endpoint, signal);
   endpointHealth.push(health);
 }
 const capabilityTests = [];
 for (const endpoint of declaredEndpoints) {
-  const capability = await testChatCapabilityWithRetry(endpoint);
+  const capability = await testChatCapabilityWithRetry(endpoint, signal);
   capabilityTests.push(capability);
 }
 const report = buildVerifyReport(
@@ -494,13 +545,21 @@ const report = buildVerifyReport(
       evidence: agentData
     });
   } catch (error) {
+    if (signal.aborted) {
+      return res.status(504).json({ error: "Verify total time limit exceeded" });
+    }
+    if (error.code === "RESPONSE_TOO_LARGE") {
+      return res.status(502).json({ error: "Agent registry response exceeds size limit" });
+    }
     console.error(error);
 
     res.status(500).json({
       error: "Velrix Verify failed"
     });
+  } finally {
+    clearTimeout(timeout);
   }
-});
+}));
 
 app.listen(PORT, () => {
   console.log(`Velrix is running at http://localhost:${PORT}`);
